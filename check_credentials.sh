@@ -282,32 +282,50 @@ test_api() {
 # Veeam Backup & Replication REST API :
 # 1) POST /api/oauth2/token (OAuth2 password grant)
 # 2) GET /api/v1/serverInfo avec le Bearer token obtenu.
+#
+# Le username et le password sont placés dans des fichiers temporaires en 600
+# puis envoyés avec data-urlencode name@file. Cela reproduit le comportement du
+# curl manuel validé pour les comptes AD DOMAIN\\user, sans exposer les secrets
+# dans la ligne de commande du processus curl.
 test_veeam() {
     local host="$1" port="$2" username_ref="$3" password_ref="$4" verify_tls="$5" api_version="$6"
-    local username password token_url server_url auth_cfg verify_cfg auth_response auth_http auth_rc access_token verify_http verify_rc escaped
+    local username password token_url server_url auth_cfg verify_cfg user_file pass_file
+    local auth_response auth_http auth_rc access_token verify_http verify_rc escaped
 
     username="$(require_secret "$username_ref" "Veeam username")" || { printf '0|%s' "$username"; return; }
     password="$(require_secret "$password_ref" "Veeam password")" || { printf '0|%s' "$password"; return; }
     api_version="${api_version:-$VEEAM_API_VERSION_DEFAULT}"; verify_tls="${verify_tls:-true}"
     token_url="https://${host}:${port}/api/oauth2/token"; server_url="https://${host}:${port}/api/v1/serverInfo"
-    auth_cfg="${RUNTIME_DIR}/veeam_auth_${BASHPID}_${RANDOM}.conf"; verify_cfg="${RUNTIME_DIR}/veeam_verify_${BASHPID}_${RANDOM}.conf"
+    auth_cfg="${RUNTIME_DIR}/veeam_auth_${BASHPID}_${RANDOM}.conf"
+    verify_cfg="${RUNTIME_DIR}/veeam_verify_${BASHPID}_${RANDOM}.conf"
+    user_file="${RUNTIME_DIR}/veeam_user_${BASHPID}_${RANDOM}.secret"
+    pass_file="${RUNTIME_DIR}/veeam_pass_${BASHPID}_${RANDOM}.secret"
 
-    umask 077; : > "$auth_cfg" || { printf '0|Unable to create Veeam curl configuration'; return; }; chmod 600 "$auth_cfg"
+    umask 077
+    printf '%s' "$username" > "$user_file" || { printf '0|Unable to create Veeam username temporary file'; return; }
+    printf '%s' "$password" > "$pass_file" || { rm -f -- "$user_file"; printf '0|Unable to create Veeam password temporary file'; return; }
+    chmod 600 "$user_file" "$pass_file"
+
+    : > "$auth_cfg" || { rm -f -- "$user_file" "$pass_file"; printf '0|Unable to create Veeam curl configuration'; return; }
+    chmod 600 "$auth_cfg"
     {
         escaped="$(curl_config_escape "$token_url")" || return; printf 'url = "%s"\nrequest = "POST"\n' "$escaped"
         printf 'silent\nshow-error\nconnect-timeout = "%s"\nmax-time = "%s"\n' "$CURL_CONNECT_TIMEOUT" "$CURL_MAX_TIME"
         printf 'header = "Content-Type: application/x-www-form-urlencoded"\n'
         escaped="$(curl_config_escape "x-api-version: ${api_version}")" || return; printf 'header = "%s"\n' "$escaped"
         printf 'data-urlencode = "grant_type=password"\n'
-        escaped="$(curl_config_escape "username=${username}")" || return; printf 'data-urlencode = "%s"\n' "$escaped"
-        escaped="$(curl_config_escape "password=${password}")" || return; printf 'data-urlencode = "%s"\n' "$escaped"
+        printf 'data-urlencode = "username@%s"\n' "$user_file"
+        printf 'data-urlencode = "password@%s"\n' "$pass_file"
         printf 'write-out = "\\n%%{http_code}"\n'
         [[ "$(lower "$verify_tls")" =~ ^(false|no|0)$ ]] && printf 'insecure\n'
     } >> "$auth_cfg"
 
+    username=""; password=""
     log_verbose "Veeam auth host=$host port=$port api_version=$api_version"
-    auth_response="$(timeout "$GLOBAL_TIMEOUT" curl --disable --config "$auth_cfg" 2>/dev/null)"; auth_rc=$?; rm -f -- "$auth_cfg"; password=""
+    auth_response="$(timeout "$GLOBAL_TIMEOUT" curl --disable --config "$auth_cfg" 2>/dev/null)"; auth_rc=$?
+    rm -f -- "$auth_cfg" "$user_file" "$pass_file"
     (( auth_rc == 0 )) || { printf '0|%s' "$(classify_curl_error "$auth_rc")"; return; }
+
     auth_http="${auth_response##*$'\n'}"; auth_response="${auth_response%$'\n'*}"
     case "$auth_http" in
         200) ;;
