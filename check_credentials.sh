@@ -1,1185 +1,153 @@
-#!/usr/bin/sh
-#
-# check_credentials.sh
-#
-# Vérification de credentials de supervision :
-#   - SNMP v1 / v2c
-#   - SNMPv3 : noAuthNoPriv / authNoPriv / authPriv
-#   - API HTTP/HTTPS : Basic / Bearer / API Key / none
-#
-# Les ressources sont décrites dans resources.csv.
-# Les secrets sont stockés dans secrets.env, avec permissions 600.
-#
-# Codes de sortie :
-#   0 = tous les tests exécutés sont valides
-#   1 = au moins un test est non valide
-#   2 = erreur de configuration / dépendance / argument
-#
-
+#!/usr/bin/env bash
+# check_credentials.sh - SNMP / HTTP(S) / Veeam credential checks
 set -uo pipefail
 
-###############################################################################
-# Configuration générale
-###############################################################################
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
-CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/resources.csv}"
-SECRETS_FILE="${SECRETS_FILE:-${SCRIPT_DIR}/secrets.env}"
-
+CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/resources.csv}"
+SECRETS_FILE="${SECRETS_FILE:-$SCRIPT_DIR/secrets.env}"
 GLOBAL_TIMEOUT="${GLOBAL_TIMEOUT:-10}"
 CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-5}"
 CURL_MAX_TIME="${CURL_MAX_TIME:-10}"
-
 SNMP_TIMEOUT="${SNMP_TIMEOUT:-2}"
-SNMP_RETRIES="${SNMP_RETRIES:-1}"
+SNMP_RETRIES="${SNMP_RETRIES:-0}"
+SNMP_TEST_OID="${SNMP_TEST_OID:-1.3.6.1.2.1.1.5}"
+VEEAM_API_VERSION_DEFAULT="${VEEAM_API_VERSION_DEFAULT:-1.3-rev1}"
+FILTER_RESOURCE=""; FILTER_PROTOCOL=""; VERBOSE=0
+VALID_COUNT=0; INVALID_COUNT=0; TESTED_COUNT=0; SKIPPED_COUNT=0
 
-# OID simple utilisé pour valider une interrogation SNMP.
-SNMP_TEST_OID=".1.3.6.1.2.1.1.3.0"
+if [[ -t 1 && "${NO_COLOR:-0}" != 1 ]]; then
+  RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; BLUE=$'\033[0;34m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+else RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; RESET=""; fi
 
-FILTER_RESOURCE=""
-FILTER_PROTOCOL=""
-VERBOSE=0
-
-VALID_COUNT=0
-INVALID_COUNT=0
-TESTED_COUNT=0
-SKIPPED_COUNT=0
-
-###############################################################################
-# Couleurs ANSI
-###############################################################################
-
-if [[ -t 1 && "${NO_COLOR:-0}" != "1" ]]; then
-    RED=$'\033[0;31m'
-    GREEN=$'\033[0;32m'
-    YELLOW=$'\033[0;33m'
-    BLUE=$'\033[0;34m'
-    BOLD=$'\033[1m'
-    RESET=$'\033[0m'
-else
-    RED=""
-    GREEN=""
-    YELLOW=""
-    BLUE=""
-    BOLD=""
-    RESET=""
-fi
-
-###############################################################################
-# Répertoire temporaire protégé
-###############################################################################
-
-TMP_BASE="${XDG_RUNTIME_DIR:-/tmp}"
 RUNTIME_DIR=""
-
-cleanup() {
-    if [[ -n "${RUNTIME_DIR:-}" && -d "$RUNTIME_DIR" ]]; then
-        rm -rf -- "$RUNTIME_DIR"
-    fi
-}
-
+cleanup(){ [[ -n "$RUNTIME_DIR" && -d "$RUNTIME_DIR" ]] && rm -rf -- "$RUNTIME_DIR"; }
 trap cleanup EXIT HUP INT TERM
+log_verbose(){ (( VERBOSE )) && printf '%s[DEBUG]%s %s\n' "$BLUE" "$RESET" "$*" >&2 || true; }
+die(){ printf '%sERREUR:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 2; }
+lower(){ printf '%s' "${1,,}"; }
+trim_cr(){ printf '%s' "${1%$'\r'}"; }
 
-###############################################################################
-# Fonctions utilitaires
-###############################################################################
+usage(){ cat <<'USAGE'
+Usage: ./check_credentials.sh [--resource NOM] [--protocol snmp|api] [--verbose]
+       [--config resources.csv] [--secrets secrets.env]
 
-usage() {
-    cat <<'EOF'
-Usage:
-  ./check_credentials.sh
-  ./check_credentials.sh --resource NOM
-  ./check_credentials.sh --protocol snmp
-  ./check_credentials.sh --protocol api
-  ./check_credentials.sh --verbose
-
-Options:
-  --resource NOM       Tester uniquement la ressource NOM.
-  --protocol PROTO     Filtrer sur "snmp" ou "api".
-  --verbose            Afficher davantage de diagnostics, sans secrets.
-  --config FICHIER     Utiliser un autre fichier resources.csv.
-  --secrets FICHIER    Utiliser un autre fichier secrets.env.
-  -h, --help           Afficher cette aide.
-
-Variables d'environnement facultatives :
-  GLOBAL_TIMEOUT
-  CURL_CONNECT_TIMEOUT
-  CURL_MAX_TIME
-  SNMP_TIMEOUT
-  SNMP_RETRIES
-  SNMP_TEST_OID
-  NO_COLOR=1
-EOF
+Veeam :
+  auth_type=veeam     VBR REST API OAuth2
+  auth_type=veeam_em  Enterprise Manager : Basic Auth + POST /api/session
+USAGE
 }
 
-log_verbose() {
-    if (( VERBOSE )); then
-        printf '%s[DEBUG]%s %s\n' "$BLUE" "$RESET" "$*" >&2
-    fi
+get_secret(){ local r="${1:-}"; [[ "$r" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && -v "$r" ]] || return 1; printf '%s' "${!r}"; }
+require_secret(){ local r="$1" d="$2" v; v="$(get_secret "$r")" || { printf 'Secret absent : %s (%s)' "$d" "$r"; return 1; }; [[ -n "$v" ]] || { printf 'Secret vide : %s (%s)' "$d" "$r"; return 1; }; printf '%s' "$v"; }
+curl_escape(){ local v="$1"; [[ "$v" != *$'\n'* && "$v" != *$'\r'* ]] || return 1; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; printf '%s' "$v"; }
+
+check_permissions(){ local m g o; [[ -f "$SECRETS_FILE" ]] || die "Fichier de secrets introuvable : $SECRETS_FILE"; m="$(stat -c '%a' "$SECRETS_FILE")" || die "Permissions illisibles"; g="${m: -2:1}"; o="${m: -1}"; ((10#$g==0 && 10#$o==0)) || die "Permissions non sûres ($m). Utiliser chmod 600 '$SECRETS_FILE'"; }
+check_dependencies(){ local miss=() c; for c in curl snmpwalk timeout stat mktemp sed; do command -v "$c" >/dev/null 2>&1 || miss+=("$c"); done; ((${#miss[@]}==0)) || { printf 'Dépendances manquantes : %s\n' "${miss[*]}" >&2; return 1; }; }
+init(){ check_dependencies || exit 2; check_permissions; source "$SECRETS_FILE"; umask 077; RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/check_credentials.XXXXXX")" || die "mktemp impossible"; chmod 700 "$RUNTIME_DIR"; }
+
+print_header(){ printf '%-28s | %-30s | %-10s | %-6s | %s\n' RESSOURCE IP/FQDN PROTOCOLE PORT RÉSULTAT; printf '%-28s-+-%-30s-+-%-10s-+-%-6s-+-%s\n' ---------------------------- ------------------------------ ---------- ------ ------------------------------------------; }
+print_result(){ local n="$1" h="$2" p="$3" po="$4" ok="$5" why="$6" s; if [[ "$ok" == 1 ]]; then s="${GREEN}VALIDE${RESET}"; ((VALID_COUNT++)); else s="${RED}NON VALIDE${RESET}"; ((INVALID_COUNT++)); fi; [[ -n "$why" ]] && s+=" - $why"; ((TESTED_COUNT++)); printf '%-28.28s | %-30.30s | %-10.10s | %-6.6s | %b\n' "$n" "$h" "$p" "$po" "$s"; }
+
+classify_curl(){ case "$1" in 5) echo 'Proxy resolution failure';; 6) echo 'DNS resolution failure';; 7) echo 'Port closed / connection refused';; 28|124) echo Timeout;; 35) echo 'TLS handshake failure';; 52) echo 'Empty response';; 56) echo 'Network receive failure';; 60) echo 'TLS certificate validation failure';; *) echo "Network/curl error (rc=$1)";; esac; }
+classify_snmp(){ local t="${1,,}" rc="$2"; if ((rc==124)); then echo Timeout; elif [[ "$t" == *"authentication failure"* || "$t" == *"wrong digest"* || "$t" == *"unknown user"* ]]; then echo 'SNMP authentication failure'; elif [[ "$t" == *"decryption"* ]]; then echo 'SNMP privacy/decryption failure'; elif [[ "$t" == *"timeout"* || "$t" == *"no response"* ]]; then echo 'Timeout / No SNMP response'; elif [[ "$t" == *"no route to host"* || "$t" == *"network is unreachable"* ]]; then echo 'Host unreachable'; elif [[ "$t" == *"unknown host"* || "$t" == *"name or service not known"* ]]; then echo 'DNS resolution failure'; elif [[ "$t" == *"authorization"* || "$t" == *"no access"* ]]; then echo 'SNMP authorization denied'; else echo "SNMP request failed (rc=$rc)"; fi; }
+
+snmp_target(){ [[ -z "$2" || "$2" == 161 ]] && printf '%s' "$1" || printf 'udp:%s:%s' "$1" "$2"; }
+test_snmp(){
+  local host="$1" port="$2" ver="$3" cref="$4" uref="$5" lvl="$6" aproto="$7" aref="$8" pproto="$9" pref="${10}" target out rc community user apass ppass
+  target="$(snmp_target "$host" "$port")"
+  case "${ver,,}" in
+    1|2|2c)
+      community="$(require_secret "$cref" 'SNMP community')" || { printf '0|%s' "$community"; return; }
+      [[ "$ver" == 2 ]] && ver=2c
+      out="$(timeout "$GLOBAL_TIMEOUT" snmpwalk -v "$ver" -c "$community" -t "$SNMP_TIMEOUT" -r "$SNMP_RETRIES" -Oqv "$target" "$SNMP_TEST_OID" 2>&1)"; rc=$?; community="" ;;
+    3)
+      user="$(require_secret "$uref" 'SNMPv3 username')" || { printf '0|%s' "$user"; return; }
+      case "${lvl,,}" in
+        noauthnopriv) out="$(timeout "$GLOBAL_TIMEOUT" snmpwalk -v3 -u "$user" -l noAuthNoPriv -t "$SNMP_TIMEOUT" -r "$SNMP_RETRIES" -Oqv "$target" "$SNMP_TEST_OID" 2>&1)"; rc=$? ;;
+        authnopriv) apass="$(require_secret "$aref" 'SNMPv3 auth password')" || { printf '0|%s' "$apass"; return; }; out="$(timeout "$GLOBAL_TIMEOUT" snmpwalk -v3 -u "$user" -l authNoPriv -a "$aproto" -A "$apass" -t "$SNMP_TIMEOUT" -r "$SNMP_RETRIES" -Oqv "$target" "$SNMP_TEST_OID" 2>&1)"; rc=$?; apass="" ;;
+        authpriv) apass="$(require_secret "$aref" 'SNMPv3 auth password')" || { printf '0|%s' "$apass"; return; }; ppass="$(require_secret "$pref" 'SNMPv3 privacy password')" || { printf '0|%s' "$ppass"; return; }; out="$(timeout "$GLOBAL_TIMEOUT" snmpwalk -v3 -u "$user" -l authPriv -a "$aproto" -A "$apass" -x "$pproto" -X "$ppass" -t "$SNMP_TIMEOUT" -r "$SNMP_RETRIES" -Oqv "$target" "$SNMP_TEST_OID" 2>&1)"; rc=$?; apass=""; ppass="" ;;
+        *) printf '0|Unsupported SNMPv3 security level'; return;;
+      esac ;;
+    *) printf '0|Unsupported SNMP version'; return;;
+  esac
+  ((rc==0)) && [[ -n "$out" ]] && { printf '1|SNMP response OK'; return; }
+  printf '0|%s' "$(classify_snmp "$out" "$rc")"
 }
 
-die() {
-    printf '%sERREUR:%s %s\n' "$RED" "$RESET" "$*" >&2
-    exit 2
+build_url(){ local e="$4"; [[ "$e" =~ ^https?:// ]] && { printf '%s' "$e"; return; }; [[ -n "$e" ]] || e=/; [[ "$e" == /* ]] || e="/$e"; printf '%s://%s:%s%s' "$2" "$1" "$3" "$e"; }
+
+# Generic HTTP(S) check. Secrets are stored in a temporary curl config (0600), never logged.
+test_api(){
+  local host="$1" scheme="$2" port="$3" auth="$4" uref="$5" pref="$6" endpoint="$7" tref="$8" keyhdr="$9" keyref="${10}" method="${11:-GET}" tls="${12:-true}"
+  local u="" p="" tok="" key="" url cfg code rc esc
+  case "${auth,,}" in none|"") ;; basic) u="$(require_secret "$uref" 'API username')" || { printf '0|%s' "$u"; return; }; p="$(require_secret "$pref" 'API password')" || { printf '0|%s' "$p"; return; };; bearer) tok="$(require_secret "$tref" 'Bearer token')" || { printf '0|%s' "$tok"; return; };; apikey|api_key) key="$(require_secret "$keyref" 'API key')" || { printf '0|%s' "$key"; return; };; *) printf '0|Unsupported API authentication type'; return;; esac
+  url="$(build_url "$host" "$scheme" "$port" "$endpoint")"; cfg="$RUNTIME_DIR/api_${BASHPID}_${RANDOM}.conf"; : >"$cfg"; chmod 600 "$cfg"
+  { esc="$(curl_escape "$url")"; printf 'url = "%s"\nrequest = "%s"\nsilent\nshow-error\noutput = "/dev/null"\nwrite-out = "%%{http_code}"\nconnect-timeout = "%s"\nmax-time = "%s"\n' "$esc" "$method" "$CURL_CONNECT_TIMEOUT" "$CURL_MAX_TIME"; [[ "$(lower "$tls")" =~ ^(false|no|0)$ ]] && echo insecure; case "${auth,,}" in basic) esc="$(curl_escape "$u:$p")"; printf 'user = "%s"\nbasic\n' "$esc";; bearer) esc="$(curl_escape "Authorization: Bearer $tok")"; printf 'header = "%s"\n' "$esc";; apikey|api_key) esc="$(curl_escape "$keyhdr: $key")"; printf 'header = "%s"\n' "$esc";; esac; } >>"$cfg"
+  u=""; p=""; tok=""; key=""; code="$(timeout "$GLOBAL_TIMEOUT" curl --disable --config "$cfg" 2>/dev/null)"; rc=$?; rm -f "$cfg"
+  ((rc==0)) || { printf '0|%s' "$(classify_curl "$rc")"; return; }
+  case "$code" in 2??|3??) printf '1|HTTP %s' "$code";; 401) printf '0|HTTP 401 - Authentication failed';; 403) printf '0|HTTP 403 - Forbidden';; 404) printf '0|HTTP 404 - Endpoint not found';; 5??) printf '0|HTTP %s - Server error' "$code";; *) printf '0|HTTP %s' "${code:-000}";; esac
 }
 
-trim_cr() {
-    # Supprime un éventuel CR provenant d'un fichier CSV en CRLF.
-    local value="$1"
-    printf '%s' "${value%$'\r'}"
+# Veeam VBR REST API OAuth2. Kept for environments using /api/oauth2/token.
+test_veeam(){
+  local host="$1" port="$2" uref="$3" pref="$4" tls="${5:-true}" ver="${6:-$VEEAM_API_VERSION_DEFAULT}" u p uf pf cfg response code body token vcfg vcode rc esc
+  u="$(require_secret "$uref" 'Veeam username')" || { printf '0|%s' "$u"; return; }; p="$(require_secret "$pref" 'Veeam password')" || { printf '0|%s' "$p"; return; }
+  uf="$RUNTIME_DIR/vu_${RANDOM}"; pf="$RUNTIME_DIR/vp_${RANDOM}"; cfg="$RUNTIME_DIR/va_${RANDOM}.conf"; printf %s "$u" >"$uf"; printf %s "$p" >"$pf"; chmod 600 "$uf" "$pf"; : >"$cfg"; chmod 600 "$cfg"
+  { printf 'url = "https://%s:%s/api/oauth2/token"\nrequest = "POST"\nsilent\nshow-error\nconnect-timeout = "%s"\nmax-time = "%s"\nheader = "Content-Type: application/x-www-form-urlencoded"\nheader = "x-api-version: %s"\ndata-urlencode = "grant_type=password"\ndata-urlencode = "username@%s"\ndata-urlencode = "password@%s"\nwrite-out = "\\n%%{http_code}"\n' "$host" "$port" "$CURL_CONNECT_TIMEOUT" "$CURL_MAX_TIME" "$ver" "$uf" "$pf"; [[ "$(lower "$tls")" =~ ^(false|no|0)$ ]] && echo insecure; } >>"$cfg"
+  u=""; p=""; response="$(timeout "$GLOBAL_TIMEOUT" curl --disable --config "$cfg" 2>/dev/null)"; rc=$?; rm -f "$cfg" "$uf" "$pf"; ((rc==0)) || { printf '0|%s' "$(classify_curl "$rc")"; return; }
+  code="${response##*$'\n'}"; body="${response%$'\n'*}"; [[ "$code" == 200 ]] || { printf '0|Veeam OAuth authentication failed (HTTP %s)' "$code"; return; }; token="$(printf %s "$body" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"; [[ -n "$token" ]] || { printf '0|Veeam access_token missing'; return; }
+  vcfg="$RUNTIME_DIR/vv_${RANDOM}.conf"; : >"$vcfg"; chmod 600 "$vcfg"; esc="$(curl_escape "Authorization: Bearer $token")"; { printf 'url = "https://%s:%s/api/v1/serverInfo"\nrequest = "GET"\nsilent\nshow-error\noutput = "/dev/null"\nwrite-out = "%%{http_code}"\nheader = "%s"\nheader = "x-api-version: %s"\n' "$host" "$port" "$esc" "$ver"; [[ "$(lower "$tls")" =~ ^(false|no|0)$ ]] && echo insecure; } >>"$vcfg"; token=""; vcode="$(timeout "$GLOBAL_TIMEOUT" curl --disable --config "$vcfg" 2>/dev/null)"; rc=$?; rm -f "$vcfg"; ((rc==0)) || { printf '0|%s' "$(classify_curl "$rc")"; return; }; [[ "$vcode" == 200 ]] && printf '1|Veeam authentication OK (HTTP 200)' || printf '0|Veeam serverInfo failed (HTTP %s)' "$vcode"
 }
 
-lower() {
-    printf '%s' "${1,,}"
-}
-
-is_valid_var_name() {
-    [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
-}
-
-get_secret() {
-    # Reçoit le NOM d'une variable, jamais le secret lui-même.
-    #
-    # Exemple :
-    #   get_secret "API_APP_TOKEN"
-    #
-    # Retour :
-    #   stdout = valeur du secret
-    #   rc=0    = variable trouvée
-    #   rc=1    = aucune référence
-    #   rc=2    = nom invalide / variable absente
-    local ref="${1:-}"
-
-    [[ -n "$ref" ]] || return 1
-
-    if ! is_valid_var_name "$ref"; then
-        return 2
-    fi
-
-    if [[ ! -v "$ref" ]]; then
-        return 2
-    fi
-
-    printf '%s' "${!ref}"
-}
-
-require_secret() {
-    local ref="$1"
-    local description="$2"
-    local value
-
-    if ! value="$(get_secret "$ref")"; then
-        printf '%s' "Secret absent ou référence invalide : ${description} (${ref})"
-        return 1
-    fi
-
-    if [[ -z "$value" ]]; then
-        printf '%s' "Secret vide : ${description} (${ref})"
-        return 1
-    fi
-
-    printf '%s' "$value"
-}
-
-safe_single_line() {
-    # Les fichiers temporaires de configuration sont basés sur une ligne
-    # par directive. Un secret avec CR/LF est donc refusé.
-    [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]]
-}
-
-curl_config_escape() {
-    # Échappement pour une valeur placée entre guillemets dans un curl config.
-    # On refuse les retours à la ligne.
-    local value="$1"
-
-    safe_single_line "$value" || return 1
-
-    value="${value//\\/\\\\}"
-    value="${value//\"/\\\"}"
-
-    printf '%s' "$value"
-}
-
-snmp_config_value_is_safe() {
-    # Évite l'injection d'une nouvelle directive dans snmp.conf.
-    safe_single_line "$1"
-}
-
-create_runtime_dir() {
-    umask 077
-
-    RUNTIME_DIR="$(mktemp -d "${TMP_BASE%/}/check_credentials.XXXXXXXX")" \
-        || die "Impossible de créer le répertoire temporaire."
-
-    chmod 700 "$RUNTIME_DIR" \
-        || die "Impossible de protéger le répertoire temporaire."
-}
-
-###############################################################################
-# Validation des fichiers et dépendances
-###############################################################################
-
-check_file_permissions() {
-    local file="$1"
-    local mode
-
-    [[ -f "$file" ]] || die "Fichier de secrets introuvable : $file"
-
-    mode="$(stat -c '%a' "$file" 2>/dev/null)" \
-        || die "Impossible de lire les permissions de $file"
-
-    # Recommandation stricte : exactement 600 ou plus restrictif.
-    # On refuse tout accès groupe/autres.
-    local group_digit="${mode: -2:1}"
-    local other_digit="${mode: -1}"
-
-    if (( 10#$group_digit != 0 || 10#$other_digit != 0 )); then
-        die "Permissions non sûres sur $file (mode $mode). Utiliser : chmod 600 '$file'"
-    fi
-
-    log_verbose "Permissions du fichier de secrets acceptées : $mode"
-}
-
-load_secrets() {
-    check_file_permissions "$SECRETS_FILE"
-
-    # secrets.env est un fichier shell et doit être considéré comme sensible
-    # et administré par une personne de confiance.
-    #
-    # shellcheck disable=SC1090
-    source "$SECRETS_FILE"
-
-    log_verbose "Fichier de secrets chargé."
-}
-
-check_dependencies() {
-    local missing=()
-    local cmd
-
-    # stat/mktemp/rm sont également utilisés mais font normalement partie
-    # de coreutils sous RHEL.
-    for cmd in curl snmpget timeout stat mktemp; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing+=("$cmd")
-        fi
-    done
-
-    if (( ${#missing[@]} > 0 )); then
-        printf '%sDépendances manquantes :%s\n' "$RED" "$RESET" >&2
-        for cmd in "${missing[@]}"; do
-            printf '  - %s\n' "$cmd" >&2
-        done
-        return 1
-    fi
-
-    return 0
-}
-
-###############################################################################
-# Affichage des résultats
-###############################################################################
-
-print_header() {
-    printf '%-28s | %-30s | %-10s | %-6s | %s\n' \
-        "RESSOURCE" "IP/FQDN" "PROTOCOLE" "PORT" "RÉSULTAT"
-
-    printf '%-28s-+-%-30s-+-%-10s-+-%-6s-+-%s\n' \
-        "----------------------------" \
-        "------------------------------" \
-        "----------" \
-        "------" \
-        "------------------------------------------"
-}
-
-print_result() {
-    local name="$1"
-    local host="$2"
-    local protocol="$3"
-    local port="$4"
-    local valid="$5"
-    local reason="$6"
-
-    local status
-
-    if [[ "$valid" == "1" ]]; then
-        status="${GREEN}VALIDE${RESET}"
-        if [[ -n "$reason" ]]; then
-            status+=" - $reason"
-        fi
-        ((VALID_COUNT++))
-    else
-        status="${RED}NON VALIDE${RESET}"
-        if [[ -n "$reason" ]]; then
-            status+=" - $reason"
-        fi
-        ((INVALID_COUNT++))
-    fi
-
-    ((TESTED_COUNT++))
-
-    printf '%-28.28s | %-30.30s | %-10.10s | %-6.6s | %b\n' \
-        "$name" "$host" "$protocol" "$port" "$status"
-}
-
-###############################################################################
-# Gestion SNMP
-###############################################################################
-
-classify_snmp_error() {
-    local output="$1"
-    local rc="$2"
-    local text="${output,,}"
-
-    if (( rc == 124 )); then
-        printf '%s' "Timeout"
-    elif [[ "$text" == *"authentication failure"* ]] ||
-         [[ "$text" == *"wrong digest"* ]] ||
-         [[ "$text" == *"unknown user name"* ]] ||
-         [[ "$text" == *"usm"* && "$text" == *"error"* ]]; then
-        printf '%s' "SNMP authentication failure"
-    elif [[ "$text" == *"decryption error"* ]] ||
-         [[ "$text" == *"privacy"* && "$text" == *"error"* ]]; then
-        printf '%s' "SNMP privacy/decryption failure"
-    elif [[ "$text" == *"timeout: no response"* ]] ||
-         [[ "$text" == *"no response from"* ]]; then
-        printf '%s' "Timeout / no SNMP response"
-    elif [[ "$text" == *"unknown host"* ]] ||
-         [[ "$text" == *"name or service not known"* ]] ||
-         [[ "$text" == *"temporary failure in name resolution"* ]]; then
-        printf '%s' "Host/DNS unreachable"
-    elif [[ "$text" == *"network is unreachable"* ]] ||
-         [[ "$text" == *"no route to host"* ]]; then
-        printf '%s' "Host unreachable"
-    elif [[ "$text" == *"connection refused"* ]]; then
-        printf '%s' "Port closed / connection refused"
-    elif [[ "$text" == *"authorizationerror"* ]] ||
-         [[ "$text" == *"no access"* ]]; then
-        printf '%s' "SNMP authorization denied"
-    else
-        printf '%s' "SNMP request failed (rc=$rc)"
-    fi
-}
-
-write_snmp_config() {
-    local file="$1"
-    local version="$2"
-    local community="$3"
-    local username="$4"
-    local sec_level="$5"
-    local auth_proto="$6"
-    local auth_pass="$7"
-    local priv_proto="$8"
-    local priv_pass="$9"
-
-    umask 077
-    : > "$file" || return 1
-    chmod 600 "$file" || return 1
-
-    {
-        printf 'defVersion %s\n' "$version"
-
-        case "$version" in
-            1|2c)
-                snmp_config_value_is_safe "$community" || return 1
-                printf 'defCommunity %s\n' "$community"
-                ;;
-            3)
-                snmp_config_value_is_safe "$username" || return 1
-                snmp_config_value_is_safe "$sec_level" || return 1
-
-                printf 'defSecurityName %s\n' "$username"
-                printf 'defSecurityLevel %s\n' "$sec_level"
-
-                case "$sec_level" in
-                    noAuthNoPriv)
-                        ;;
-                    authNoPriv)
-                        snmp_config_value_is_safe "$auth_proto" || return 1
-                        snmp_config_value_is_safe "$auth_pass" || return 1
-
-                        printf 'defAuthType %s\n' "$auth_proto"
-                        printf 'defAuthPassphrase %s\n' "$auth_pass"
-                        ;;
-                    authPriv)
-                        snmp_config_value_is_safe "$auth_proto" || return 1
-                        snmp_config_value_is_safe "$auth_pass" || return 1
-                        snmp_config_value_is_safe "$priv_proto" || return 1
-                        snmp_config_value_is_safe "$priv_pass" || return 1
-
-                        printf 'defAuthType %s\n' "$auth_proto"
-                        printf 'defAuthPassphrase %s\n' "$auth_pass"
-                        printf 'defPrivType %s\n' "$priv_proto"
-                        printf 'defPrivPassphrase %s\n' "$priv_pass"
-                        ;;
-                    *)
-                        return 1
-                        ;;
-                esac
-                ;;
-            *)
-                return 1
-                ;;
-        esac
-    } >> "$file"
-}
-
-test_snmp() {
-    local host="$1"
-    local port="$2"
-    local snmp_version="$3"
-    local community_ref="$4"
-    local username_ref="$5"
-    local sec_level="$6"
-    local auth_proto="$7"
-    local auth_pass_ref="$8"
-    local priv_proto="$9"
-    local priv_pass_ref="${10}"
-
-    local community=""
-    local username=""
-    local auth_pass=""
-    local priv_pass=""
-    local cfg
-    local output
-    local rc
-    local reason
-
-    case "$snmp_version" in
-        1|2c)
-            if ! community="$(require_secret "$community_ref" "community SNMP")"; then
-                printf '0|%s' "$community"
-                return
-            fi
-            ;;
-        3)
-            if ! username="$(require_secret "$username_ref" "username SNMPv3")"; then
-                printf '0|%s' "$username"
-                return
-            fi
-
-            case "$sec_level" in
-                noAuthNoPriv)
-                    ;;
-                authNoPriv)
-                    if ! auth_pass="$(require_secret \
-                        "$auth_pass_ref" "mot de passe d'authentification SNMPv3")"; then
-                        printf '0|%s' "$auth_pass"
-                        return
-                    fi
-
-                    [[ -n "$auth_proto" ]] || {
-                        printf '0|SNMPv3 auth protocol absent'
-                        return
-                    }
-                    ;;
-                authPriv)
-                    if ! auth_pass="$(require_secret \
-                        "$auth_pass_ref" "mot de passe d'authentification SNMPv3")"; then
-                        printf '0|%s' "$auth_pass"
-                        return
-                    fi
-
-                    if ! priv_pass="$(require_secret \
-                        "$priv_pass_ref" "mot de passe de chiffrement SNMPv3")"; then
-                        printf '0|%s' "$priv_pass"
-                        return
-                    fi
-
-                    [[ -n "$auth_proto" ]] || {
-                        printf '0|SNMPv3 auth protocol absent'
-                        return
-                    }
-
-                    [[ -n "$priv_proto" ]] || {
-                        printf '0|SNMPv3 privacy protocol absent'
-                        return
-                    }
-                    ;;
-                *)
-                    printf '0|Invalid SNMPv3 security level'
-                    return
-                    ;;
-            esac
-            ;;
-        *)
-            printf '0|Unsupported SNMP version'
-            return
-            ;;
-    esac
-
-    cfg="${RUNTIME_DIR}/snmp_${BASHPID}_${RANDOM}.conf"
-
-    if ! write_snmp_config \
-        "$cfg" \
-        "$snmp_version" \
-        "$community" \
-        "$username" \
-        "$sec_level" \
-        "$auth_proto" \
-        "$auth_pass" \
-        "$priv_proto" \
-        "$priv_pass"; then
-
-        rm -f -- "$cfg"
-        printf '0|Unable to build secure SNMP configuration'
-        return
-    fi
-
-    log_verbose \
-        "SNMP test host=$host port=$port version=$snmp_version level=${sec_level:-n/a}"
-
-    # SNMPCONFPATH pointe uniquement vers notre configuration temporaire.
-    #
-    # MIBS="" évite de dépendre du chargement de MIBs pour l'OID numérique.
-    #
-    # Aucun community/password/passphrase n'est fourni sur argv.
-    output="$(
-        SNMPCONFPATH="$RUNTIME_DIR" \
-        MIBS="" \
-        timeout "$GLOBAL_TIMEOUT" \
-        snmpget \
-            -v "$snmp_version" \
-            -t "$SNMP_TIMEOUT" \
-            -r "$SNMP_RETRIES" \
-            -On \
-            -Oqv \
-            "udp:${host}:${port}" \
-            "$SNMP_TEST_OID" \
-            2>&1
-    )"
+# Veeam Enterprise Manager: reproduit exactement la méthode validée
+# curl -k -u "user:password" -X POST "https://FQDN/api/session".
+# Note: --user place brièvement les credentials dans argv du processus curl.
+test_veeam_em(){
+  local host="$1" scheme="$2" port="$3" uref="$4" pref="$5" endpoint="${6:-/api/session}" tls="${7:-true}"
+  local u p url code rc
+
+  u="$(require_secret "$uref" 'Veeam Enterprise Manager username')" || { printf '0|%s' "$u"; return; }
+  p="$(require_secret "$pref" 'Veeam Enterprise Manager password')" || { printf '0|%s' "$p"; return; }
+  [[ -n "$endpoint" ]] || endpoint=/api/session
+  url="$(build_url "$host" "$scheme" "$port" "$endpoint")"
+
+  log_verbose "Veeam EM host=$host port=$port endpoint=$endpoint auth=basic"
+
+  if [[ "$(lower "$tls")" =~ ^(false|no|0)$ ]]; then
+    code="$(timeout "$GLOBAL_TIMEOUT" curl --disable --silent --show-error --insecure --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" --output /dev/null --write-out '%{http_code}' --user "$u:$p" --request POST "$url" 2>/dev/null)"
     rc=$?
-
-    rm -f -- "$cfg"
-
-    if (( rc == 0 )) && [[ -n "$output" ]]; then
-        printf '1|SNMP query successful'
-        return
-    fi
-
-    reason="$(classify_snmp_error "$output" "$rc")"
-
-    if (( VERBOSE )); then
-        # Les erreurs Net-SNMP peuvent parfois inclure des informations de
-        # configuration. On ne réaffiche donc pas le texte brut complet.
-        log_verbose "SNMP result host=$host rc=$rc reason=$reason"
-    fi
-
-    printf '0|%s' "$reason"
-}
-
-###############################################################################
-# Gestion HTTP / API
-###############################################################################
-
-classify_curl_error() {
-    local rc="$1"
-
-    case "$rc" in
-        5)
-            printf '%s' "Proxy resolution failure"
-            ;;
-        6)
-            printf '%s' "DNS resolution failure"
-            ;;
-        7)
-            printf '%s' "Port closed / connection refused"
-            ;;
-        28)
-            printf '%s' "Timeout"
-            ;;
-        35)
-            printf '%s' "TLS handshake failure"
-            ;;
-        47)
-            printf '%s' "Too many redirects"
-            ;;
-        52)
-            printf '%s' "Empty response from server"
-            ;;
-        56)
-            printf '%s' "Network receive failure"
-            ;;
-        60)
-            printf '%s' "TLS certificate validation failure"
-            ;;
-        *)
-            printf 'Network/curl error (rc=%s)' "$rc"
-            ;;
-    esac
-}
-
-build_url() {
-    local host="$1"
-    local protocol="$2"
-    local port="$3"
-    local endpoint="$4"
-
-    # Si endpoint contient déjà une URL absolue, on l'utilise.
-    if [[ "$endpoint" =~ ^https?:// ]]; then
-        printf '%s' "$endpoint"
-        return
-    fi
-
-    [[ -n "$endpoint" ]] || endpoint="/"
-
-    if [[ "$endpoint" != /* ]]; then
-        endpoint="/$endpoint"
-    fi
-
-    printf '%s://%s:%s%s' "$protocol" "$host" "$port" "$endpoint"
-}
-
-write_curl_config() {
-    local file="$1"
-    local url="$2"
-    local method="$3"
-    local auth_type="$4"
-    local username="$5"
-    local password="$6"
-    local token="$7"
-    local api_key_header="$8"
-    local api_key="$9"
-    local verify_tls="${10}"
-
-    local escaped
-
-    umask 077
-    : > "$file" || return 1
-    chmod 600 "$file" || return 1
-
-    {
-        escaped="$(curl_config_escape "$url")" || return 1
-        printf 'url = "%s"\n' "$escaped"
-
-        escaped="$(curl_config_escape "$method")" || return 1
-        printf 'request = "%s"\n' "$escaped"
-
-        printf 'silent\n'
-        printf 'show-error\n'
-        printf 'output = "/dev/null"\n'
-        printf 'write-out = "%%{http_code}"\n'
-        printf 'connect-timeout = "%s"\n' "$CURL_CONNECT_TIMEOUT"
-        printf 'max-time = "%s"\n' "$CURL_MAX_TIME"
-
-        # Évite qu'un ~/.curlrc local modifie le comportement.
-        # "--disable" doit être premier argument côté ligne de commande
-        # et sera passé directement lors de l'appel.
-
-        if [[ "$(lower "$verify_tls")" == "false" ||
-              "$(lower "$verify_tls")" == "no" ||
-              "$verify_tls" == "0" ]]; then
-            printf 'insecure\n'
-        fi
-
-        case "$(lower "$auth_type")" in
-            none|"")
-                ;;
-
-            basic)
-                escaped="$(curl_config_escape "${username}:${password}")" \
-                    || return 1
-                printf 'user = "%s"\n' "$escaped"
-                printf 'basic\n'
-                ;;
-
-            bearer)
-                escaped="$(curl_config_escape "Authorization: Bearer ${token}")" \
-                    || return 1
-                printf 'header = "%s"\n' "$escaped"
-                ;;
-
-            apikey|api_key)
-                escaped="$(curl_config_escape "${api_key_header}: ${api_key}")" \
-                    || return 1
-                printf 'header = "%s"\n' "$escaped"
-                ;;
-
-            *)
-                return 1
-                ;;
-        esac
-    } >> "$file"
-}
-
-test_api() {
-    local host="$1"
-    local scheme="$2"
-    local port="$3"
-    local auth_type="$4"
-    local username_ref="$5"
-    local password_ref="$6"
-    local endpoint="$7"
-    local token_ref="$8"
-    local api_key_header="$9"
-    local api_key_ref="${10}"
-    local method="${11}"
-    local verify_tls="${12}"
-
-    local username=""
-    local password=""
-    local token=""
-    local api_key=""
-    local url
-    local cfg
-    local http_code
-    local rc
-
-    auth_type="$(lower "$auth_type")"
-    method="${method:-GET}"
-    verify_tls="${verify_tls:-true}"
-
-    case "$auth_type" in
-        none|"")
-            ;;
-
-        basic)
-            if ! username="$(require_secret "$username_ref" "API username")"; then
-                printf '0|%s' "$username"
-                return
-            fi
-
-            if ! password="$(require_secret "$password_ref" "API password")"; then
-                printf '0|%s' "$password"
-                return
-            fi
-            ;;
-
-        bearer)
-            if ! token="$(require_secret "$token_ref" "Bearer token")"; then
-                printf '0|%s' "$token"
-                return
-            fi
-            ;;
-
-        apikey|api_key)
-            [[ -n "$api_key_header" ]] || {
-                printf '0|API key header missing'
-                return
-            }
-
-            if ! api_key="$(require_secret "$api_key_ref" "API key")"; then
-                printf '0|%s' "$api_key"
-                return
-            fi
-            ;;
-
-        *)
-            printf '0|Unsupported API authentication type'
-            return
-            ;;
-    esac
-
-    url="$(build_url "$host" "$scheme" "$port" "$endpoint")"
-
-    cfg="${RUNTIME_DIR}/curl_${BASHPID}_${RANDOM}.conf"
-
-    if ! write_curl_config \
-        "$cfg" \
-        "$url" \
-        "$method" \
-        "$auth_type" \
-        "$username" \
-        "$password" \
-        "$token" \
-        "$api_key_header" \
-        "$api_key" \
-        "$verify_tls"; then
-
-        rm -f -- "$cfg"
-        printf '0|Unable to build secure curl configuration'
-        return
-    fi
-
-    log_verbose \
-        "API test host=$host scheme=$scheme port=$port method=$method endpoint=$endpoint auth=$auth_type"
-
-    http_code="$(
-        timeout "$GLOBAL_TIMEOUT" \
-        curl --disable --config "$cfg" \
-        2>/dev/null
-    )"
+  else
+    code="$(timeout "$GLOBAL_TIMEOUT" curl --disable --silent --show-error --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" --output /dev/null --write-out '%{http_code}' --user "$u:$p" --request POST "$url" 2>/dev/null)"
     rc=$?
+  fi
 
-    rm -f -- "$cfg"
-
-    if (( rc != 0 )); then
-        printf '0|%s' "$(classify_curl_error "$rc")"
-        return
-    fi
-
-    case "$http_code" in
-        2??)
-            printf '1|HTTP %s' "$http_code"
-            ;;
-        3??)
-            # Une redirection obtenue après authentification est généralement
-            # une réponse exploitable, mais l'endpoint cible mérite validation.
-            printf '1|HTTP %s' "$http_code"
-            ;;
-        401)
-            printf '0|HTTP 401 - Authentication failed'
-            ;;
-        403)
-            printf '0|HTTP 403 - Forbidden / authorization denied'
-            ;;
-        404)
-            printf '0|HTTP 404 - Endpoint not found'
-            ;;
-        405)
-            printf '0|HTTP 405 - HTTP method not allowed'
-            ;;
-        408)
-            printf '0|HTTP 408 - Request timeout'
-            ;;
-        429)
-            printf '0|HTTP 429 - Rate limited'
-            ;;
-        5??)
-            printf '0|HTTP %s - Server error' "$http_code"
-            ;;
-        000|"")
-            printf '0|No HTTP response'
-            ;;
-        *)
-            printf '0|HTTP %s' "$http_code"
-            ;;
-    esac
+  u=""; p=""
+  ((rc==0)) || { printf '0|%s' "$(classify_curl "$rc")"; return; }
+  case "$code" in
+    2??) printf '1|Veeam Enterprise Manager authentication OK (HTTP %s)' "$code" ;;
+    401) printf '0|Veeam Enterprise Manager authentication failed (HTTP 401)' ;;
+    403) printf '0|Veeam Enterprise Manager authentication forbidden (HTTP 403)' ;;
+    404) printf '0|Veeam Enterprise Manager session endpoint not found (HTTP 404)' ;;
+    405) printf '0|Veeam Enterprise Manager POST not allowed (HTTP 405)' ;;
+    5??) printf '0|Veeam Enterprise Manager server error (HTTP %s)' "$code" ;;
+    *) printf '0|Veeam Enterprise Manager session failed (HTTP %s)' "${code:-000}" ;;
+  esac
 }
 
-###############################################################################
-# Parsing des arguments
-###############################################################################
+parse_args(){ while (($#)); do case "$1" in --resource) FILTER_RESOURCE="$2"; shift 2;; --protocol) FILTER_PROTOCOL="$(lower "$2")"; [[ "$FILTER_PROTOCOL" =~ ^(snmp|api)$ ]] || die '--protocol doit être snmp ou api'; shift 2;; --verbose) VERBOSE=1; shift;; --config) CONFIG_FILE="$2"; shift 2;; --secrets) SECRETS_FILE="$2"; shift 2;; -h|--help) usage; exit 0;; *) die "Option inconnue : $1";; esac; done; }
 
-parse_args() {
-    while (( $# > 0 )); do
-        case "$1" in
-            --resource)
-                [[ $# -ge 2 ]] || die "--resource nécessite une valeur."
-                FILTER_RESOURCE="$2"
-                shift 2
-                ;;
-
-            --protocol)
-                [[ $# -ge 2 ]] || die "--protocol nécessite une valeur."
-                FILTER_PROTOCOL="$(lower "$2")"
-
-                case "$FILTER_PROTOCOL" in
-                    snmp|api)
-                        ;;
-                    *)
-                        die "--protocol doit être 'snmp' ou 'api'."
-                        ;;
-                esac
-
-                shift 2
-                ;;
-
-            --verbose)
-                VERBOSE=1
-                shift
-                ;;
-
-            --config)
-                [[ $# -ge 2 ]] || die "--config nécessite un fichier."
-                CONFIG_FILE="$2"
-                shift 2
-                ;;
-
-            --secrets)
-                [[ $# -ge 2 ]] || die "--secrets nécessite un fichier."
-                SECRETS_FILE="$2"
-                shift 2
-                ;;
-
-            -h|--help)
-                usage
-                exit 0
-                ;;
-
-            *)
-                die "Option inconnue : $1"
-                ;;
-        esac
-    done
+process_resource(){
+  local name="$1" host="$2" proto="$3" port="$4" auth="$5" uref="$6" pref="$7" cref="$8" ver="$9" lvl="${10}" aproto="${11}" aref="${12}" pproto="${13}" privref="${14}" endpoint="${15}" tref="${16}" keyhdr="${17}" keyref="${18}" method="${19}" tls="${20}" apiver="${21:-}" result display scheme ok why
+  proto="$(lower "$proto")"; auth="$(lower "$auth")"; [[ -n "$FILTER_RESOURCE" && "$name" != "$FILTER_RESOURCE" ]] && { ((SKIPPED_COUNT++)); return; }; [[ "$FILTER_PROTOCOL" == snmp && "$proto" != snmp ]] && { ((SKIPPED_COUNT++)); return; }; [[ "$FILTER_PROTOCOL" == api && ! "$proto" =~ ^(http|https|api)$ ]] && { ((SKIPPED_COUNT++)); return; }
+  case "$proto" in snmp) display="SNMP$ver"; result="$(test_snmp "$host" "$port" "$ver" "$cref" "$uref" "$lvl" "$aproto" "$aref" "$pproto" "$privref")";; http|https|api) scheme="$proto"; [[ "$scheme" == api ]] && scheme=https; case "$auth" in veeam) display=VEEAM; result="$(test_veeam "$host" "$port" "$uref" "$pref" "$tls" "$apiver")";; veeam_em) display=VEEAM-EM; result="$(test_veeam_em "$host" "$scheme" "$port" "$uref" "$pref" "$endpoint" "$tls")";; *) display="${scheme^^}"; result="$(test_api "$host" "$scheme" "$port" "$auth" "$uref" "$pref" "$endpoint" "$tref" "$keyhdr" "$keyref" "$method" "$tls")";; esac;; *) print_result "$name" "$host" "$proto" "$port" 0 'Unsupported protocol'; return;; esac
+  ok="${result%%|*}"; why="${result#*|}"; print_result "$name" "$host" "$display" "$port" "$ok" "$why"
 }
 
-###############################################################################
-# Traitement d'une ressource
-###############################################################################
-
-process_resource() {
-    local name="$1"
-    local host="$2"
-    local protocol="$3"
-    local port="$4"
-    local auth_type="$5"
-    local username_ref="$6"
-    local password_ref="$7"
-    local community_ref="$8"
-    local snmp_version="$9"
-    local snmp_sec_level="${10}"
-    local snmp_auth_proto="${11}"
-    local snmp_auth_pass_ref="${12}"
-    local snmp_priv_proto="${13}"
-    local snmp_priv_pass_ref="${14}"
-    local endpoint="${15}"
-    local token_ref="${16}"
-    local api_key_header="${17}"
-    local api_key_ref="${18}"
-    local http_method="${19}"
-    local verify_tls="${20}"
-
-    local result
-    local valid
-    local reason
-    local displayed_protocol
-
-    protocol="$(lower "$protocol")"
-    auth_type="$(lower "$auth_type")"
-
-    # Filtres.
-    if [[ -n "$FILTER_RESOURCE" && "$name" != "$FILTER_RESOURCE" ]]; then
-        ((SKIPPED_COUNT++))
-        return
-    fi
-
-    if [[ -n "$FILTER_PROTOCOL" ]]; then
-        case "$FILTER_PROTOCOL" in
-            snmp)
-                [[ "$protocol" == "snmp" ]] || {
-                    ((SKIPPED_COUNT++))
-                    return
-                }
-                ;;
-            api)
-                [[ "$protocol" == "http" || "$protocol" == "https" ||
-                   "$protocol" == "api" ]] || {
-                    ((SKIPPED_COUNT++))
-                    return
-                }
-                ;;
-        esac
-    fi
-
-    if [[ -z "$name" || -z "$host" || -z "$protocol" || -z "$port" ]]; then
-        print_result \
-            "${name:-UNKNOWN}" \
-            "${host:-UNKNOWN}" \
-            "${protocol:-UNKNOWN}" \
-            "${port:-?}" \
-            0 \
-            "Invalid resource configuration"
-        return
-    fi
-
-    case "$protocol" in
-        snmp)
-            displayed_protocol="SNMP${snmp_version}"
-
-            result="$(test_snmp \
-                "$host" \
-                "$port" \
-                "$snmp_version" \
-                "$community_ref" \
-                "$username_ref" \
-                "$snmp_sec_level" \
-                "$snmp_auth_proto" \
-                "$snmp_auth_pass_ref" \
-                "$snmp_priv_proto" \
-                "$snmp_priv_pass_ref")"
-            ;;
-
-        http|https)
-            displayed_protocol="${protocol^^}"
-
-            result="$(test_api \
-                "$host" \
-                "$protocol" \
-                "$port" \
-                "$auth_type" \
-                "$username_ref" \
-                "$password_ref" \
-                "$endpoint" \
-                "$token_ref" \
-                "$api_key_header" \
-                "$api_key_ref" \
-                "$http_method" \
-                "$verify_tls")"
-            ;;
-
-        api)
-            # Si "api" est utilisé comme protocole générique dans le CSV,
-            # HTTPS est choisi par défaut.
-            displayed_protocol="HTTPS"
-
-            result="$(test_api \
-                "$host" \
-                "https" \
-                "$port" \
-                "$auth_type" \
-                "$username_ref" \
-                "$password_ref" \
-                "$endpoint" \
-                "$token_ref" \
-                "$api_key_header" \
-                "$api_key_ref" \
-                "$http_method" \
-                "$verify_tls")"
-            ;;
-
-        *)
-            print_result \
-                "$name" "$host" "$protocol" "$port" \
-                0 "Unsupported protocol"
-            return
-            ;;
-    esac
-
-    valid="${result%%|*}"
-    reason="${result#*|}"
-
-    print_result \
-        "$name" \
-        "$host" \
-        "$displayed_protocol" \
-        "$port" \
-        "$valid" \
-        "$reason"
+process_csv(){
+  [[ -f "$CONFIG_FILE" ]] || die "Fichier de configuration introuvable : $CONFIG_FILE"; local line=0 found=0
+  while IFS=',' read -r name host proto port auth uref pref cref ver lvl aproto aref pproto privref endpoint tref keyhdr keyref method tls apiver; do ((line++)); tls="$(trim_cr "${tls:-}")"; apiver="$(trim_cr "${apiver:-}")"; [[ -z "${name//[[:space:]]/}" || "$name" == \#* ]] && continue; ((line==1)) && [[ "$(lower "$name")" == name ]] && continue; found=1; process_resource "$name" "$host" "$proto" "$port" "$auth" "$uref" "$pref" "$cref" "$ver" "$lvl" "$aproto" "$aref" "$pproto" "$privref" "$endpoint" "$tref" "$keyhdr" "$keyref" "$method" "$tls" "$apiver"; done <"$CONFIG_FILE"
+  ((found)) || die "Aucune ressource dans $CONFIG_FILE"
 }
 
-###############################################################################
-# Lecture du CSV
-###############################################################################
-
-process_csv() {
-    [[ -f "$CONFIG_FILE" ]] || die "Fichier de configuration introuvable : $CONFIG_FILE"
-
-    local line_number=0
-    local found_resource=0
-
-    # IMPORTANT :
-    # Ce CSV est volontairement simple. Les champs ne doivent pas contenir
-    # de virgules ni utiliser un dialecte CSV avec champs multilignes.
-    #
-    # Pour des besoins plus complexes, préférer YAML/JSON + parser dédié.
-    while IFS=',' read -r \
-        name \
-        host \
-        protocol \
-        port \
-        auth_type \
-        username_ref \
-        password_ref \
-        community_ref \
-        snmp_version \
-        snmp_sec_level \
-        snmp_auth_proto \
-        snmp_auth_pass_ref \
-        snmp_priv_proto \
-        snmp_priv_pass_ref \
-        endpoint \
-        token_ref \
-        api_key_header \
-        api_key_ref \
-        http_method \
-        verify_tls
-    do
-        ((line_number++))
-
-        # Éventuel CRLF.
-        verify_tls="$(trim_cr "${verify_tls:-}")"
-
-        # Ligne vide.
-        [[ -n "${name//[[:space:]]/}" ]] || continue
-
-        # Commentaires.
-        [[ "$name" == \#* ]] && continue
-
-        # En-tête CSV.
-        if (( line_number == 1 )) && [[ "$(lower "$name")" == "name" ]]; then
-            continue
-        fi
-
-        found_resource=1
-
-        process_resource \
-            "$name" \
-            "$host" \
-            "$protocol" \
-            "$port" \
-            "$auth_type" \
-            "$username_ref" \
-            "$password_ref" \
-            "$community_ref" \
-            "$snmp_version" \
-            "$snmp_sec_level" \
-            "$snmp_auth_proto" \
-            "$snmp_auth_pass_ref" \
-            "$snmp_priv_proto" \
-            "$snmp_priv_pass_ref" \
-            "$endpoint" \
-            "$token_ref" \
-            "$api_key_header" \
-            "$api_key_ref" \
-            "$http_method" \
-            "$verify_tls"
-
-    done < "$CONFIG_FILE"
-
-    (( found_resource )) || die "Aucune ressource dans $CONFIG_FILE"
-}
-
-###############################################################################
-# Résumé
-###############################################################################
-
-print_summary() {
-    printf '\n%s---%s\n\n' "$BOLD" "$RESET"
-    printf '%sRésumé des tests%s\n\n' "$BOLD" "$RESET"
-
-    printf 'Ressources testées     : %d\n' "$TESTED_COUNT"
-    printf 'Ressources valides     : %b%d%b\n' \
-        "$GREEN" "$VALID_COUNT" "$RESET"
-    printf 'Ressources non valides : %b%d%b\n' \
-        "$RED" "$INVALID_COUNT" "$RESET"
-
-    if (( VERBOSE && SKIPPED_COUNT > 0 )); then
-        printf 'Ressources ignorées    : %d\n' "$SKIPPED_COUNT"
-    fi
-}
-
-###############################################################################
-# Main
-###############################################################################
-
-main() {
-    parse_args "$@"
-
-    check_dependencies \
-        || exit 2
-
-    load_secrets
-    create_runtime_dir
-
-    printf '%sVérification des credentials de supervision%s\n' "$BOLD" "$RESET"
-    printf 'Configuration : %s\n\n' "$CONFIG_FILE"
-
-    print_header
-    process_csv
-    print_summary
-
-    if (( TESTED_COUNT == 0 )); then
-        printf '\n%sAucune ressource ne correspond aux filtres.%s\n' \
-            "$YELLOW" "$RESET"
-        exit 2
-    fi
-
-    if (( INVALID_COUNT > 0 )); then
-        exit 1
-    fi
-
-    exit 0
-}
-
+main(){ parse_args "$@"; init; printf '%sVérification des credentials de supervision%s\nConfiguration : %s\n\n' "$BOLD" "$RESET" "$CONFIG_FILE"; print_header; process_csv; printf '\n%sRésumé :%s %b%d valide(s)%b / %b%d non valide(s)%b\n' "$BOLD" "$RESET" "$GREEN" "$VALID_COUNT" "$RESET" "$RED" "$INVALID_COUNT" "$RESET"; ((TESTED_COUNT)) || exit 2; ((INVALID_COUNT)) && exit 1; exit 0; }
 main "$@"
