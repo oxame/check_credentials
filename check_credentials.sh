@@ -99,14 +99,39 @@ test_veeam(){
   vcfg="$RUNTIME_DIR/vv_${RANDOM}.conf"; : >"$vcfg"; chmod 600 "$vcfg"; esc="$(curl_escape "Authorization: Bearer $token")"; { printf 'url = "https://%s:%s/api/v1/serverInfo"\nrequest = "GET"\nsilent\nshow-error\noutput = "/dev/null"\nwrite-out = "%%{http_code}"\nheader = "%s"\nheader = "x-api-version: %s"\n' "$host" "$port" "$esc" "$ver"; [[ "$(lower "$tls")" =~ ^(false|no|0)$ ]] && echo insecure; } >>"$vcfg"; token=""; vcode="$(timeout "$GLOBAL_TIMEOUT" curl --disable --config "$vcfg" 2>/dev/null)"; rc=$?; rm -f "$vcfg"; ((rc==0)) || { printf '0|%s' "$(classify_curl "$rc")"; return; }; [[ "$vcode" == 200 ]] && printf '1|Veeam authentication OK (HTTP 200)' || printf '0|Veeam serverInfo failed (HTTP %s)' "$vcode"
 }
 
-# Veeam Enterprise Manager: equivalent to curl -k -u user:password -X POST https://FQDN/api/session.
+# Veeam Enterprise Manager: reproduit exactement la méthode validée
+# curl -k -u "user:password" -X POST "https://FQDN/api/session".
+# Note: --user place brièvement les credentials dans argv du processus curl.
 test_veeam_em(){
-  local host="$1" scheme="$2" port="$3" uref="$4" pref="$5" endpoint="${6:-/api/session}" tls="${7:-true}" u p url cfg code rc esc
-  u="$(require_secret "$uref" 'Veeam Enterprise Manager username')" || { printf '0|%s' "$u"; return; }; p="$(require_secret "$pref" 'Veeam Enterprise Manager password')" || { printf '0|%s' "$p"; return; }
-  url="$(build_url "$host" "$scheme" "$port" "$endpoint")"; cfg="$RUNTIME_DIR/vem_${BASHPID}_${RANDOM}.conf"; : >"$cfg"; chmod 600 "$cfg"; esc="$(curl_escape "$u:$p")"
-  { printf 'url = "%s"\nrequest = "POST"\nsilent\nshow-error\noutput = "/dev/null"\nwrite-out = "%%{http_code}"\nconnect-timeout = "%s"\nmax-time = "%s"\nuser = "%s"\nbasic\n' "$url" "$CURL_CONNECT_TIMEOUT" "$CURL_MAX_TIME" "$esc"; [[ "$(lower "$tls")" =~ ^(false|no|0)$ ]] && echo insecure; } >>"$cfg"
-  u=""; p=""; log_verbose "Veeam EM host=$host port=$port endpoint=$endpoint"; code="$(timeout "$GLOBAL_TIMEOUT" curl --disable --config "$cfg" 2>/dev/null)"; rc=$?; rm -f "$cfg"; ((rc==0)) || { printf '0|%s' "$(classify_curl "$rc")"; return; }
-  case "$code" in 2??) printf '1|Veeam Enterprise Manager authentication OK (HTTP %s)' "$code";; 401) printf '0|Veeam Enterprise Manager authentication failed (HTTP 401)';; 403) printf '0|Veeam Enterprise Manager authentication forbidden (HTTP 403)';; 404) printf '0|Veeam Enterprise Manager session endpoint not found (HTTP 404)';; 405) printf '0|Veeam Enterprise Manager POST not allowed (HTTP 405)';; 5??) printf '0|Veeam Enterprise Manager server error (HTTP %s)' "$code";; *) printf '0|Veeam Enterprise Manager session failed (HTTP %s)' "${code:-000}";; esac
+  local host="$1" scheme="$2" port="$3" uref="$4" pref="$5" endpoint="${6:-/api/session}" tls="${7:-true}"
+  local u p url code rc
+
+  u="$(require_secret "$uref" 'Veeam Enterprise Manager username')" || { printf '0|%s' "$u"; return; }
+  p="$(require_secret "$pref" 'Veeam Enterprise Manager password')" || { printf '0|%s' "$p"; return; }
+  [[ -n "$endpoint" ]] || endpoint=/api/session
+  url="$(build_url "$host" "$scheme" "$port" "$endpoint")"
+
+  log_verbose "Veeam EM host=$host port=$port endpoint=$endpoint auth=basic"
+
+  if [[ "$(lower "$tls")" =~ ^(false|no|0)$ ]]; then
+    code="$(timeout "$GLOBAL_TIMEOUT" curl --disable --silent --show-error --insecure --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" --output /dev/null --write-out '%{http_code}' --user "$u:$p" --request POST "$url" 2>/dev/null)"
+    rc=$?
+  else
+    code="$(timeout "$GLOBAL_TIMEOUT" curl --disable --silent --show-error --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" --output /dev/null --write-out '%{http_code}' --user "$u:$p" --request POST "$url" 2>/dev/null)"
+    rc=$?
+  fi
+
+  u=""; p=""
+  ((rc==0)) || { printf '0|%s' "$(classify_curl "$rc")"; return; }
+  case "$code" in
+    2??) printf '1|Veeam Enterprise Manager authentication OK (HTTP %s)' "$code" ;;
+    401) printf '0|Veeam Enterprise Manager authentication failed (HTTP 401)' ;;
+    403) printf '0|Veeam Enterprise Manager authentication forbidden (HTTP 403)' ;;
+    404) printf '0|Veeam Enterprise Manager session endpoint not found (HTTP 404)' ;;
+    405) printf '0|Veeam Enterprise Manager POST not allowed (HTTP 405)' ;;
+    5??) printf '0|Veeam Enterprise Manager server error (HTTP %s)' "$code" ;;
+    *) printf '0|Veeam Enterprise Manager session failed (HTTP %s)' "${code:-000}" ;;
+  esac
 }
 
 parse_args(){ while (($#)); do case "$1" in --resource) FILTER_RESOURCE="$2"; shift 2;; --protocol) FILTER_PROTOCOL="$(lower "$2")"; [[ "$FILTER_PROTOCOL" =~ ^(snmp|api)$ ]] || die '--protocol doit être snmp ou api'; shift 2;; --verbose) VERBOSE=1; shift;; --config) CONFIG_FILE="$2"; shift 2;; --secrets) SECRETS_FILE="$2"; shift 2;; -h|--help) usage; exit 0;; *) die "Option inconnue : $1";; esac; done; }
